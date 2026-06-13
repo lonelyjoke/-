@@ -97,6 +97,7 @@ celerybeat-schedule
 # Environments
 .env
 .venv
+.uv-cache/
 env/
 venv/
 ENV/
@@ -125,3 +126,7 @@ test_auto_report.html
 # docs/examples 的运行产物（HTML 报告、parquet、Position JSON 等）
 docs/examples/_output/
 docs/examples/.DS_Store
+
+# Local quant strategy cache and reports
+data/cache/
+data/reports/

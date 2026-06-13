@@ -1,0 +1,15 @@
+{
+  "mode": "tushare",
+  "pool": "csi500-history",
+  "index_code": "000905.SH",
+  "start_date": "20200101",
+  "end_date": "20240601",
+  "backtest_start": "20200701",
+  "base_freq": "30分钟",
+  "limit": 50,
+  "fee_rate": 0.0002,
+  "max_workers": 1,
+  "cache_dir": "data/cache/chan_strategy",
+  "output_dir": "data/reports/chan_strategy"
+}
+
