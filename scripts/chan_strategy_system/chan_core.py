@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,8 +26,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "cache" / "chan_strategy"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "data" / "reports" / "chan_strategy"
-DEFAULT_ANALYSIS_FREQS = "日线,60分钟,30分钟,15分钟"
+DEFAULT_ANALYSIS_FREQS = "日线,60分钟,30分钟"
 HORIZONS = (1, 3, 5, 10, 20)
+SIGNAL_CACHE_VERSION = "v2_signals_20260613a"
+QUICK_MAX_BARS_BY_FREQ = {
+    "日线": 900,
+    "60分钟": 2200,
+    "30分钟": 2600,
+    "15分钟": 3200,
+}
 
 
 def _avoid_unbuilt_source_package() -> None:
@@ -58,6 +66,7 @@ class CoreConfig:
     end_date: str = "20240601"
     backtest_start: str = "20200701"
     analysis_freqs: str = DEFAULT_ANALYSIS_FREQS
+    speed_mode: str = "standard"
     fq: str = "后复权"
     cache_dir: str = str(DEFAULT_CACHE_DIR)
     output_dir: str = str(DEFAULT_OUTPUT_DIR)
@@ -72,6 +81,7 @@ def parse_args() -> CoreConfig:
     parser.add_argument("--end-date")
     parser.add_argument("--backtest-start")
     parser.add_argument("--analysis-freqs")
+    parser.add_argument("--speed-mode", choices=["quick", "standard"], default=None)
     parser.add_argument("--fq")
     parser.add_argument("--cache-dir")
     parser.add_argument("--output-dir")
@@ -124,6 +134,13 @@ def _analysis_freqs(cfg: CoreConfig) -> list[str]:
     return freqs
 
 
+def _validate_speed_mode(cfg: CoreConfig) -> str:
+    mode = (cfg.speed_mode or "standard").strip().lower()
+    if mode not in {"quick", "standard"}:
+        raise ValueError("speed_mode 只能是 quick 或 standard")
+    return mode
+
+
 def _require_tushare_token() -> None:
     token = os.environ.get("TUSHARE_TOKEN", "")
     if not token:
@@ -158,8 +175,10 @@ def _load_tushare_bars(symbol: str, freq: str, cfg: CoreConfig) -> tuple[list, p
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{symbol}_{asset}_{cfg.start_date}_{cfg.end_date}_{_safe_name(cfg.fq)}.parquet"
     if cache_file.exists():
+        print(f"[v2-cache-hit] {symbol} {freq} {cache_file}", flush=True)
         df = pd.read_parquet(cache_file)
     else:
+        print(f"[v2-fetch] {symbol} {freq} asset={asset} range={cfg.start_date}-{cfg.end_date}", flush=True)
         adj = "qfq" if cfg.fq == "前复权" else "hfq"
         pro = init_tushare()
         if freq == "日线":
@@ -170,14 +189,36 @@ def _load_tushare_bars(symbol: str, freq: str, cfg: CoreConfig) -> tuple[list, p
         if df.empty:
             raise RuntimeError(f"No bars returned for {symbol} {freq}.")
         df.to_parquet(cache_file, index=False)
+        print(f"[v2-cache-write] {symbol} {freq} rows={len(df)} {cache_file}", flush=True)
     df = normalize_kline_dtypes(df)
-    return format_standard_kline(df, freq=freq), df
+    print(f"[v2-format] {symbol} {freq} rows={len(df)}", flush=True)
+    bars = format_standard_kline(df, freq=freq)
+    print(f"[v2-format-done] {symbol} {freq} bars={len(bars)}", flush=True)
+    return bars, df
 
 
 def load_bars(symbol: str, freq: str, cfg: CoreConfig) -> tuple[list, pd.DataFrame]:
     if cfg.mode == "mock":
         return _load_mock_bars(symbol, freq, cfg)
     return _load_tushare_bars(symbol, freq, cfg)
+
+
+def apply_speed_mode(symbol: str, freq: str, bars: list, df: pd.DataFrame, cfg: CoreConfig) -> tuple[list, pd.DataFrame]:
+    """Trim old bars in quick mode for interactive single-symbol diagnosis."""
+    if _validate_speed_mode(cfg) != "quick":
+        return bars, df
+    max_bars = QUICK_MAX_BARS_BY_FREQ.get(freq)
+    if not max_bars or len(bars) <= max_bars:
+        return bars, df
+    bars = bars[-max_bars:]
+    df = df.tail(max_bars).reset_index(drop=True)
+    first_dt = pd.to_datetime(df["dt"].iloc[0]) if not df.empty else "-"
+    last_dt = pd.to_datetime(df["dt"].iloc[-1]) if not df.empty else "-"
+    print(
+        f"[v2-quick-trim] {symbol} {freq} bars={len(bars)} window={first_dt}~{last_dt}",
+        flush=True,
+    )
+    return bars, df
 
 
 def signal_configs(freq: str) -> list[dict]:
@@ -219,19 +260,54 @@ def resolve_signal_name(name: str):
     return getattr(module, name, None)
 
 
-def generate_signals(bars: list, freq: str, cfg: CoreConfig) -> pd.DataFrame:
+def _signals_cache_path(symbol: str, freq: str, bars: list, cfg: CoreConfig) -> Path:
+    first_dt = _safe_name(str(getattr(bars[0], "dt", "na"))) if bars else "na"
+    last_dt = _safe_name(str(getattr(bars[-1], "dt", "na"))) if bars else "na"
+    cache_dir = Path(cfg.cache_dir) / "signals" / _safe_name(freq)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    name = "_".join(
+        [
+            _safe_name(symbol),
+            _safe_name(cfg.fq),
+            _safe_name(cfg.backtest_start),
+            _safe_name(_validate_speed_mode(cfg)),
+            str(len(bars)),
+            first_dt,
+            last_dt,
+            SIGNAL_CACHE_VERSION,
+        ]
+    )
+    return cache_dir / f"{name}.parquet"
+
+
+def generate_signals(symbol: str, bars: list, freq: str, cfg: CoreConfig) -> pd.DataFrame:
     from czsc import generate_czsc_signals
 
     if len(bars) < 100:
         return pd.DataFrame()
+    cache_file = _signals_cache_path(symbol, freq, bars, cfg)
+    if cache_file.exists():
+        try:
+            print(f"[v2-signals-cache-hit] {symbol} {freq} {cache_file}", flush=True)
+            return pd.read_parquet(cache_file)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[v2-warn] failed to read signal cache; regenerating: {type(exc).__name__}: {exc}", flush=True)
     configs = signal_configs(freq)
     if not configs:
         print(f"[v2-warn] no compatible signals available for {freq}")
         return pd.DataFrame()
+    print(f"[v2-signals] {freq} bars={len(bars)} signals={len(configs)}", flush=True)
     df = generate_czsc_signals(bars, signals_config=configs, df=True, sdt=cfg.backtest_start)
     if df is None:
         return pd.DataFrame()
-    return pd.DataFrame(df)
+    df = pd.DataFrame(df)
+    try:
+        df.to_parquet(cache_file, index=False)
+        print(f"[v2-signals-cache-write] {symbol} {freq} rows={len(df)} {cache_file}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[v2-warn] failed to write signal cache: {type(exc).__name__}: {exc}", flush=True)
+    print(f"[v2-signals-done] {freq} rows={len(df)} cols={len(df.columns)}", flush=True)
+    return df
 
 
 def signal_columns(df: pd.DataFrame) -> list[str]:
@@ -313,6 +389,225 @@ def signal_stats(symbol: str, freq: str, sigs: pd.DataFrame) -> pd.DataFrame:
                 row[f"ret_{horizon}b_sample"] = int(ret.count())
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _to_number(value) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        number = float(value)
+        if pd.isna(number):
+            return None
+        return number
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_pct(value) -> str:
+    number = _to_number(value)
+    return "-" if number is None else f"{number:.2%}"
+
+
+def _fmt_price(value) -> str:
+    number = _to_number(value)
+    return "-" if number is None else f"{number:.2f}"
+
+
+def _signal_name(freq: str, sig_type: str) -> str:
+    return f"{freq}{sig_type}"
+
+
+def build_readable_analysis(states: pd.DataFrame, candidates: pd.DataFrame, stats: pd.DataFrame, summary: dict) -> dict:
+    """Build a plain-language layer for non-quant readers."""
+    analysis = {
+        "one_liner": _one_liner(states, candidates, stats, summary),
+        "structure": _structure_notes(states),
+        "recent_signals": _recent_signal_notes(candidates),
+        "signal_stats": _signal_stat_notes(stats),
+        "risk": _risk_notes(states, candidates, stats),
+        "next_steps": _next_step_notes(summary),
+    }
+    return analysis
+
+
+def _one_liner(states: pd.DataFrame, candidates: pd.DataFrame, stats: pd.DataFrame, summary: dict) -> str:
+    if states.empty:
+        return "本次没有生成有效结构状态，优先检查数据和信号函数是否可用。"
+    symbol = str(states.iloc[0].get("symbol", "当前标的"))
+    rating = summary.get("rating", "-")
+    score = summary.get("score", "-")
+    big = states[states["freq"].isin(["日线", "60分钟"])]
+    strong = int((big["trend"] == "偏强").sum()) if not big.empty else 0
+    weak = int((states["trend"] == "偏弱").sum())
+    recent_buy = _latest_candidate(candidates, {"一买", "二买", "三买"})
+    recent_sell = _latest_candidate(candidates, {"一卖", "二卖", "三卖"})
+    parts = [f"{symbol} 当前综合评分 {score}，评级为{rating}。"]
+    if strong:
+        parts.append(f"大级别有 {strong} 个周期偏强。")
+    if weak:
+        parts.append(f"同时有 {weak} 个周期偏弱，需要防止短线回撤。")
+    if recent_buy:
+        parts.append(f"最近买点候选是{recent_buy['freq']}{recent_buy['signal_type']}。")
+    if recent_sell:
+        parts.append(f"最近也出现过{recent_sell['freq']}{recent_sell['signal_type']}，说明信号并非单边一致。")
+    return "".join(parts)
+
+
+def _structure_notes(states: pd.DataFrame) -> list[str]:
+    if states.empty:
+        return ["没有多级别结构状态。"]
+    notes = []
+    for row in states.to_dict("records"):
+        freq = row.get("freq", "-")
+        trend = row.get("trend", "-")
+        close = _fmt_price(row.get("close"))
+        risk = _fmt_price(row.get("risk_price"))
+        bi_status = str(row.get("bi_status", "-")).split("_")[0]
+        ma5 = str(row.get("ma5_state", "-")).split("_")[0]
+        ma20 = str(row.get("ma20_state", "-")).split("_")[0]
+        text = f"{freq}：收盘 {close}，结构{trend}，笔状态{bi_status}，短均线{ma5}，中期均线{ma20}，短线风险参考位约 {risk}。"
+        notes.append(text)
+    return notes
+
+
+def _recent_signal_notes(candidates: pd.DataFrame) -> list[str]:
+    if candidates.empty:
+        return ["最近没有识别到一买、二买、三买或卖点候选。"]
+    df = candidates.copy()
+    df["dt"] = pd.to_datetime(df["dt"])
+    recent = df.sort_values("dt").tail(30)
+    counts = recent.groupby(["freq", "signal_type"]).size().sort_values(ascending=False)
+    notes = []
+    for (freq, sig_type), count in counts.head(4).items():
+        last = recent[(recent["freq"] == freq) & (recent["signal_type"] == sig_type)].sort_values("dt").tail(1).iloc[0]
+        notes.append(f"最近 30 条候选中，{freq}{sig_type} 出现 {count} 次；最近一次在 {last['dt']}，价格约 {_fmt_price(last.get('close'))}。")
+    latest_buy = _latest_candidate(df, {"一买", "二买", "三买"})
+    latest_sell = _latest_candidate(df, {"一卖", "二卖", "三卖"})
+    if latest_buy and latest_sell:
+        notes.append(f"买点与卖点都出现过，说明这里更适合观察结构确认，不适合只凭单个信号直接下结论。")
+    return notes
+
+
+def _signal_stat_notes(stats: pd.DataFrame) -> list[str]:
+    if stats.empty:
+        return ["没有足够信号样本生成统计结论。"]
+    df = stats.copy()
+    for col in df.columns:
+        if col.startswith("ret_") or col == "count":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    notes = []
+    notes.append(
+        "这部分统计的是候选信号出现后，未来若干根K线的平均收益和上涨比例；它是研究标签，不是已经可以直接执行的买卖规则。"
+    )
+    notes.append(
+        "阅读顺序建议先看样本数 count，再看未来10根平均收益，最后看胜率；样本少于10次的信号只能当线索，暂时不要当结论。"
+    )
+    coverage = _signal_coverage_notes(df)
+    if coverage:
+        notes.extend(coverage)
+    buy = df[df["signal_type"].isin(["一买", "二买", "三买"])].copy()
+    if not buy.empty and "ret_10b_mean" in buy.columns:
+        ranked = buy[buy["count"].fillna(0) >= 10].sort_values("ret_10b_mean", ascending=False)
+        if not ranked.empty:
+            best = ranked.iloc[0]
+            notes.append(
+                f"买点里当前表现最好的是{_signal_name(best['freq'], best['signal_type'])}："
+                f"样本 {int(best['count'])} 次，未来10根平均收益 {_fmt_pct(best.get('ret_10b_mean'))}，"
+                f"胜率 {_fmt_pct(best.get('ret_10b_win_rate'))}。"
+            )
+        for _, row in ranked.head(3).iterrows():
+            notes.append(
+                f"{_signal_name(row['freq'], row['signal_type'])}：样本 {int(row['count'])} 次，"
+                f"未来 10 根平均收益 {_fmt_pct(row.get('ret_10b_mean'))}，胜率 {_fmt_pct(row.get('ret_10b_win_rate'))}。"
+            )
+        weak_buy = ranked[ranked["ret_10b_mean"].fillna(0) <= 0]
+        if not weak_buy.empty:
+            row = weak_buy.iloc[0]
+            notes.append(
+                f"需要警惕：{_signal_name(row['freq'], row['signal_type'])}虽然出现次数不少，"
+                f"但未来10根平均收益不占优，暂时不适合作为独立买入规则。"
+            )
+    sell = df[df["signal_type"].isin(["一卖", "二卖", "三卖"])].copy()
+    if not sell.empty and "ret_10b_mean" in sell.columns:
+        ranked = sell[sell["count"].fillna(0) >= 10].sort_values("ret_10b_mean")
+        if not ranked.empty:
+            best_risk = ranked.iloc[0]
+            notes.append(
+                f"卖点/风险提示里，{_signal_name(best_risk['freq'], best_risk['signal_type'])}后续10根平均收益最低，"
+                f"为 {_fmt_pct(best_risk.get('ret_10b_mean'))}，可优先作为风险过滤线索。"
+            )
+        for _, row in ranked.head(2).iterrows():
+            notes.append(
+                f"{_signal_name(row['freq'], row['signal_type'])}：样本 {int(row['count'])} 次，"
+                f"未来 10 根平均收益 {_fmt_pct(row.get('ret_10b_mean'))}，可作为风险提示观察。"
+            )
+    if not notes:
+        notes.append("候选信号样本偏少，暂时不适合据此制定交易规则。")
+    return notes
+
+
+def _signal_coverage_notes(df: pd.DataFrame) -> list[str]:
+    notes = []
+    for family, types in [("买点", ["一买", "二买", "三买"]), ("卖点", ["一卖", "二卖", "三卖"])]:
+        subset = df[df["signal_type"].isin(types)].copy()
+        if subset.empty:
+            notes.append(f"本次没有识别到可统计的{family}信号。")
+            continue
+        parts = []
+        for sig_type in types:
+            sig = subset[subset["signal_type"] == sig_type]
+            total = int(sig["count"].sum()) if not sig.empty else 0
+            if total:
+                parts.append(f"{sig_type} {total} 次")
+            else:
+                parts.append(f"{sig_type} 0 次")
+        notes.append(f"{family}覆盖情况：" + "，".join(parts) + "。")
+    return notes
+
+
+def _risk_notes(states: pd.DataFrame, candidates: pd.DataFrame, stats: pd.DataFrame) -> list[str]:
+    notes = []
+    if not states.empty:
+        small = states[states["freq"].isin(["30分钟", "15分钟", "5分钟"])]
+        weak_small = small[small["trend"] == "偏弱"]
+        if not weak_small.empty:
+            freqs = "、".join(weak_small["freq"].astype(str).tolist())
+            notes.append(f"{freqs} 结构偏弱，说明短线仍有回踩压力。")
+        risk_values = pd.to_numeric(states["risk_price"], errors="coerce").dropna()
+        if not risk_values.empty:
+            notes.append(f"最近结构风险位可先参考 {risk_values.max():.2f} 附近；跌破后需要重新评估买点有效性。")
+    if not candidates.empty:
+        latest_sell = _latest_candidate(candidates, {"一卖", "二卖", "三卖"})
+        if latest_sell:
+            notes.append(f"最近卖点候选为{latest_sell['freq']}{latest_sell['signal_type']}，不要把买点候选理解成无条件买入。")
+    if stats.empty:
+        notes.append("统计样本不足，当前结论只能作为结构观察。")
+    return notes or ["暂无明显风险提示，但仍需结合仓位和止损纪律。"]
+
+
+def _next_step_notes(summary: dict) -> list[str]:
+    rating = summary.get("rating", "")
+    if rating in {"积极观察", "中性偏强"}:
+        return [
+            "把该标的放入观察池，而不是直接满仓买入。",
+            "等待小级别回踩不破风险位，或再次出现买点确认。",
+            "后续用一批股票验证同类信号是否普遍有效，再决定是否写成交易规则。",
+        ]
+    return [
+        "暂不把本次信号作为主动买入依据。",
+        "继续观察是否出现更明确的大级别转强或小级别确认。",
+        "优先做批量统计，避免只根据单只股票制定规则。",
+    ]
+
+
+def _latest_candidate(candidates: pd.DataFrame, signal_types: set[str]) -> dict | None:
+    if candidates.empty:
+        return None
+    df = candidates[candidates["signal_type"].isin(signal_types)].copy()
+    if df.empty:
+        return None
+    df["dt"] = pd.to_datetime(df["dt"])
+    return dict(df.sort_values("dt").tail(1).iloc[0])
 
 
 def _latest_signal_value(sigs: pd.DataFrame, contains: str) -> str:
@@ -438,6 +733,7 @@ def build_decision_summary(states: pd.DataFrame, candidates: pd.DataFrame, stats
 
 def _write_report(run_dir: Path, cfg: CoreConfig, states: pd.DataFrame, candidates: pd.DataFrame, stats: pd.DataFrame, summary: dict) -> Path:
     path = run_dir / "v2_report.md"
+    readable = summary.get("readable", {})
     lines = [
         "# Chan Strategy V2 Core Report",
         "",
@@ -452,7 +748,51 @@ def _write_report(run_dir: Path, cfg: CoreConfig, states: pd.DataFrame, candidat
         f"- 状态评级: `{summary.get('rating')}`",
         f"- 操作建议: {summary.get('action')}",
         f"- 主要依据: {summary.get('reason')}",
+        f"- 运行口径: {summary.get('scope_note', '-')}",
         "",
+        "## 给人的解读",
+        "",
+        readable.get("one_liner", "暂无白话解读。"),
+        "",
+        "### 结构怎么读",
+        "",
+    ]
+    lines.extend([f"- {x}" for x in readable.get("structure", [])])
+    lines.extend(
+        [
+            "",
+            "### 最近信号怎么读",
+            "",
+        ]
+    )
+    lines.extend([f"- {x}" for x in readable.get("recent_signals", [])])
+    lines.extend(
+        [
+            "",
+            "### 历史统计怎么读",
+            "",
+        ]
+    )
+    lines.extend([f"- {x}" for x in readable.get("signal_stats", [])])
+    lines.extend(
+        [
+            "",
+            "### 风险提示",
+            "",
+        ]
+    )
+    lines.extend([f"- {x}" for x in readable.get("risk", [])])
+    lines.extend(
+        [
+            "",
+            "### 下一步动作",
+            "",
+        ]
+    )
+    lines.extend([f"- {x}" for x in readable.get("next_steps", [])])
+    lines.extend(
+        [
+            "",
         "## 参数",
         "",
         f"- Mode: `{cfg.mode}`",
@@ -460,22 +800,28 @@ def _write_report(run_dir: Path, cfg: CoreConfig, states: pd.DataFrame, candidat
         f"- Date range: `{cfg.start_date}` to `{cfg.end_date}`",
         f"- Signal start: `{cfg.backtest_start}`",
         f"- Analysis freqs: `{cfg.analysis_freqs}`",
+        f"- Speed mode: `{cfg.speed_mode}`",
         f"- FQ: `{cfg.fq}`",
         "",
-        "## 多级别状态",
+        "## 原始数据表",
         "",
-    ]
+        "下面的表格是给后续量化检验用的原始结果。普通阅读可以优先看上面的白话解读。",
+        "",
+        "### 多级别状态",
+        "",
+        ]
+    )
     if states.empty:
         lines.append("No states.")
     else:
         lines.extend(["```text", states.to_string(index=False), "```"])
-    lines.extend(["", "## 最近候选买卖点", ""])
+    lines.extend(["", "### 最近候选买卖点", ""])
     recent = candidates.sort_values("dt").tail(30) if not candidates.empty else candidates
     if recent.empty:
         lines.append("No candidate signals.")
     else:
         lines.extend(["```text", recent.to_string(index=False), "```"])
-    lines.extend(["", "## 信号统计", ""])
+    lines.extend(["", "### 信号统计", ""])
     if stats.empty:
         lines.append("No signal stats.")
     else:
@@ -501,6 +847,7 @@ def _write_csv(df: pd.DataFrame, path: Path) -> None:
 def run_core(cfg: CoreConfig) -> Path:
     if cfg.mode == "tushare":
         _require_tushare_token()
+    speed_mode = _validate_speed_mode(cfg)
     symbols = _normalize_symbols(cfg.symbols)
     freqs = _analysis_freqs(cfg)
 
@@ -513,12 +860,19 @@ def run_core(cfg: CoreConfig) -> Path:
     candidate_frames = []
     stat_frames = []
     errors = []
+    total_tasks = len(symbols) * len(freqs)
+    task_no = 0
+    print(f"[v2-plan] symbols={len(symbols)} freqs={','.join(freqs)} speed={speed_mode} tasks={total_tasks}", flush=True)
+    started = time.perf_counter()
     for symbol in symbols:
         for freq in freqs:
+            task_no += 1
+            task_started = time.perf_counter()
             try:
-                print(f"[v2] analyzing {symbol} {freq}")
+                print(f"[v2] analyzing {symbol} {freq} task={task_no}/{total_tasks}", flush=True)
                 bars, kline = load_bars(symbol, freq, cfg)
-                sigs = generate_signals(bars, freq, cfg)
+                bars, kline = apply_speed_mode(symbol, freq, bars, kline, cfg)
+                sigs = generate_signals(symbol, bars, freq, cfg)
                 state_rows.append(latest_state(symbol, freq, bars, kline, sigs))
                 candidates = extract_candidates(symbol, freq, sigs)
                 if not candidates.empty:
@@ -526,6 +880,8 @@ def run_core(cfg: CoreConfig) -> Path:
                 stats = signal_stats(symbol, freq, sigs)
                 if not stats.empty:
                     stat_frames.append(stats)
+                elapsed = time.perf_counter() - task_started
+                print(f"[v2-done] {symbol} {freq} task={task_no}/{total_tasks} elapsed={elapsed:.1f}s", flush=True)
             except Exception as exc:  # noqa: BLE001
                 errors.append({"symbol": symbol, "freq": freq, "error": f"{type(exc).__name__}: {exc}"})
                 print(f"[v2-error] {symbol} {freq}: {type(exc).__name__}: {exc}")
@@ -541,6 +897,13 @@ def run_core(cfg: CoreConfig) -> Path:
         stats = stats.sort_values(["symbol", "freq", "signal_type", "count"], ascending=[True, True, True, False]).reset_index(drop=True)
 
     summary = build_decision_summary(states, candidates, stats)
+    summary["speed_mode"] = _validate_speed_mode(cfg)
+    summary["scope_note"] = (
+        "快速巡检模式会截取每个级别最近一段K线，用于日常持仓诊断；完整统计检验请使用 standard。"
+        if summary["speed_mode"] == "quick"
+        else "完整研究模式使用当前参数范围内的全量K线。"
+    )
+    summary["readable"] = build_readable_analysis(states, candidates, stats, summary)
     _write_csv(states, run_dir / "v2_latest_states.csv")
     _write_csv(candidates, run_dir / "v2_candidates.csv")
     _write_csv(stats, run_dir / "v2_signal_stats.csv")
@@ -549,6 +912,7 @@ def run_core(cfg: CoreConfig) -> Path:
     (run_dir / "v2_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     report = _write_report(run_dir, cfg, states, candidates, stats, summary)
 
+    print(f"[v2-all-done] elapsed={time.perf_counter() - started:.1f}s", flush=True)
     print(f"Real Tushare data used: {cfg.mode == 'tushare'}")
     print(f"Sample data used/generated: {cfg.mode == 'mock'}")
     print(f"[done] report: {report}")

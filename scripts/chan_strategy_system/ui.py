@@ -410,6 +410,15 @@ def _layout(content: str, *, title: str = "Chan Strategy Console") -> bytes:
     }}
     .kv div:nth-child(odd) {{ color: var(--muted); }}
     .kv div:nth-child(even) {{ font-weight: 700; text-align: right; }}
+    .brief-list {{
+      margin: 0;
+      padding-left: 18px;
+      color: #344054;
+      font-size: 13px;
+    }}
+    .brief-list li {{
+      margin: 5px 0;
+    }}
     a {{ color: var(--accent-dark); }}
     @media (max-width: 840px) {{
       main .wrap {{ grid-template-columns: 1fr; }}
@@ -484,11 +493,13 @@ def _layout(content: str, *, title: str = "Chan Strategy Console") -> bytes:
       const version = document.getElementById("analysis_version")?.value || "v2";
       const v1Field = document.getElementById("v1-base-field");
       const v2Field = document.getElementById("v2-freqs-field");
+      const v2SpeedField = document.getElementById("v2-speed-field");
       if (v1Field) v1Field.style.display = version === "v1" ? "block" : "none";
       if (v2Field) {{
         v2Field.style.display = version === "v2" ? "block" : "none";
         v2Field.style.gridColumn = version === "v2" ? "1 / -1" : "auto";
       }}
+      if (v2SpeedField) v2SpeedField.style.display = version === "v2" ? "block" : "none";
     }}
 
     document.addEventListener("DOMContentLoaded", syncVersionFields);
@@ -516,6 +527,7 @@ def _form(values: dict[str, str] | None = None) -> str:
     symbol = values.get("symbol", "002202.SZ")
     mode = values.get("mode", "tushare")
     analysis_version = values.get("analysis_version", "v2")
+    speed_mode = values.get("speed_mode", "quick")
     start_date = values.get("start_date", "20200101")
     end_date = values.get("end_date", _recent_weekday())
     backtest_start = values.get("backtest_start", "20200701")
@@ -554,7 +566,14 @@ def _form(values: dict[str, str] | None = None) -> str:
       </div>
       <div id="v2-freqs-field">
         <label for="analysis_freqs">V2多级别分析周期</label>
-        <input id="analysis_freqs" name="analysis_freqs" value="{_escape(values.get("analysis_freqs", "日线,60分钟,30分钟,15分钟"))}" required>
+        <input id="analysis_freqs" name="analysis_freqs" value="{_escape(values.get("analysis_freqs", "日线,60分钟,30分钟"))}" required>
+      </div>
+      <div id="v2-speed-field">
+        <label for="speed_mode">V2运行模式</label>
+        <select id="speed_mode" name="speed_mode">
+          <option value="quick" {"selected" if speed_mode == "quick" else ""}>快速巡检：日常看持仓</option>
+          <option value="standard" {"selected" if speed_mode == "standard" else ""}>完整研究：统计检验</option>
+        </select>
       </div>
     </div>
 
@@ -595,7 +614,7 @@ def _form(values: dict[str, str] | None = None) -> str:
     <div class="bar"><div id="progress-fill" class="bar-fill"></div></div>
     <pre id="progress-log" class="progress-log"></pre>
   </div>
-  <div class="hint">真实数据模式需要你本机已设置 <code>TUSHARE_TOKEN</code>。页面不会接收或保存 token。首次运行会拉取并缓存分钟线，后续会更快。</div>
+  <div class="hint">真实数据模式需要你本机已设置 <code>TUSHARE_TOKEN</code>。页面不会接收或保存 token。V2 首次运行会缓存K线和信号；快速巡检适合日常看持仓，完整研究适合做统计检验。</div>
 </section>
 """
 
@@ -639,6 +658,7 @@ def _result_panel(result: dict | None = None) -> str:
     raw_report = result.get("report_text", "")
     is_v2 = result.get("analysis_version") == "v2"
     v2_summary = result.get("v2_summary", {})
+    v2_readable = result.get("v2_readable", {})
     v2_states = result.get("v2_states", [])
     v2_candidates = result.get("v2_candidates", [])
     v2_signal_stats = result.get("v2_signal_stats", [])
@@ -652,6 +672,7 @@ def _result_panel(result: dict | None = None) -> str:
         cards.extend(
             [
                 ("分析版本", "V2 Core", "good"),
+                ("运行模式", v2_summary.get("speed_mode", "-"), ""),
                 ("综合评分", v2_summary.get("score", "-"), ""),
                 ("状态评级", v2_summary.get("rating", "-"), ""),
             ]
@@ -696,11 +717,14 @@ def _result_panel(result: dict | None = None) -> str:
     v2_html = ""
     if is_v2:
         v2_html = f"""
+  <h3>当前怎么看</h3>
+  {_readable_html(v2_readable)}
   <h3>多级别结构状态</h3>
   {_table_from_rows(v2_states) if v2_states else '<div class="note">暂无多级别状态。</div>'}
   <h3>最近候选买卖点</h3>
   {_table_from_rows(v2_candidates) if v2_candidates else '<div class="note">最近没有识别到一买/二买/三买或卖点候选。</div>'}
-  <h3>信号统计检验入口</h3>
+  <h3>历史统计明细</h3>
+  <div class="note">先读上方“历史统计”和“风险”两块白话解读，再看下面表格。表格里的收益是信号出现后的未来收益统计，用于找规律，不等同于已确认交易规则。</div>
   {_table_from_rows(v2_signal_stats) if v2_signal_stats else '<div class="note">暂无足够候选信号生成统计结果。</div>'}
 """
     default_conclusion = (
@@ -787,7 +811,9 @@ def _build_backtest_args(form: dict[str, str]) -> list[str]:
             "--backtest-start",
             form.get("backtest_start", "20200701"),
             "--analysis-freqs",
-            form.get("analysis_freqs", "日线,60分钟,30分钟,15分钟"),
+            form.get("analysis_freqs", "日线,60分钟,30分钟"),
+            "--speed-mode",
+            form.get("speed_mode", "quick"),
             "--fq",
             form.get("fq", "后复权"),
             "--cache-dir",
@@ -958,12 +984,38 @@ def _update_progress_from_line(job_id: str, line: str) -> None:
         percent, stage = 12, "检查数据权限"
     if "[symbol] running" in text:
         percent, stage = 22, "准备标的与缓存"
+    if "[v2-plan]" in text:
+        percent, stage = 15, "V2任务规划完成"
     if "[v2] analyzing" in text:
-        percent, stage = 28, "V2多级别结构分析"
+        percent = _v2_task_percent(text, default=28)
+        stage = _v2_stage_from_line(text, "V2多级别结构分析")
+    if "[v2-fetch]" in text:
+        percent, stage = 30, _v2_stage_from_line(text, "拉取Tushare K线")
+    if "[v2-cache-hit]" in text:
+        percent, stage = 32, _v2_stage_from_line(text, "读取本地缓存")
+    if "[v2-format]" in text:
+        percent, stage = 42, _v2_stage_from_line(text, "转换缠论K线")
+    if "[v2-format-done]" in text:
+        percent, stage = 50, _v2_stage_from_line(text, "缠论K线转换完成")
+    if "[v2-quick-trim]" in text:
+        percent, stage = 53, _v2_stage_from_line(text, "快速巡检窗口已生成")
+    if "[v2-signals-cache-hit]" in text:
+        percent, stage = 66, _v2_stage_from_line(text, "读取信号缓存")
+    if "[v2-signals]" in text:
+        percent, stage = 58, _v2_stage_from_line(text, "生成缠论信号")
+    if "[v2-signals-cache-write]" in text:
+        percent, stage = 68, _v2_stage_from_line(text, "写入信号缓存")
+    if "[v2-signals-done]" in text:
+        percent, stage = 70, _v2_stage_from_line(text, "缠论信号生成完成")
+    if "[v2-done]" in text:
+        percent = _v2_task_percent(text, default=75, done=True)
+        stage = _v2_stage_from_line(text, "当前周期分析完成")
     if "[v2-error]" in text:
         percent, stage = 80, "V2分析遇到错误"
     if "RawBar(" in text:
-        percent, stage = 52, "分钟线已转为缠论K线"
+        percent, stage = 52, "缠论K线样例已生成"
+    if "[v2-all-done]" in text:
+        percent, stage = 88, "V2结果汇总"
     if "[warn] no nonzero" in text:
         percent, stage = 82, "生成报告"
     if "Real Tushare data used" in text:
@@ -976,6 +1028,27 @@ def _update_progress_from_line(job_id: str, line: str) -> None:
     if stage is not None:
         kwargs["stage"] = stage
     _update_job(job_id, **kwargs)
+
+
+def _v2_task_percent(text: str, *, default: int, done: bool = False) -> int:
+    match = re.search(r"task=(\d+)/(\d+)", text)
+    if not match:
+        return default
+    current = int(match.group(1))
+    total = max(int(match.group(2)), 1)
+    base, span = 18, 64
+    progress = current / total if done else (current - 0.5) / total
+    return max(default, min(86, int(base + span * progress)))
+
+
+def _v2_stage_from_line(text: str, fallback: str) -> str:
+    match = re.search(
+        r"(?:analyzing|hit\]|fetch\]|format\]|format-done\]|quick-trim\]|signals\]|signals-cache-hit\]|signals-cache-write\]|signals-done\]|done\])\s+([^ ]+)\s+([^ ]+)",
+        text,
+    )
+    if not match:
+        return fallback
+    return f"{fallback}：{match.group(1)} {match.group(2)}"
 
 
 def _extract_run_dir(stdout: str) -> Path | None:
@@ -1032,16 +1105,23 @@ def _load_v2_artifacts(run_dir: Path) -> dict:
     states = _read_table_csv(states_path)
     candidates = _read_table_csv(candidates_path)
     sig_stats = _read_table_csv(stats_path)
+    readable = summary.get("readable", {})
+    if sig_stats:
+        readable = _ensure_v2_reading_guide(readable, sig_stats)
     report_text = report_path.read_text(encoding="utf-8") if report_path.exists() else ""
     return {
         "analysis_version": "v2",
         "report_text": report_text,
         "v2_summary": summary,
+        "v2_readable": readable,
         "v2_states": states,
         "v2_candidates": _compact_v2_candidates(candidates),
         "v2_signal_stats": _compact_v2_stats(sig_stats),
         "conclusion": _build_v2_conclusion(summary),
-        "quality": [{"level": "说明", "message": "V2 Core 是结构与信号研究底座；它用于发现假设，不等同于最终实盘交易策略。"}],
+        "quality": [
+            {"level": "说明", "message": "V2 Core 是结构与信号研究底座；它用于发现假设，不等同于最终实盘交易策略。"},
+            {"level": "口径", "message": summary.get("scope_note", "请结合运行模式判断统计范围。")},
+        ],
         "files": {
             "report": str(report_path) if report_path.exists() else "",
             "states": str(states_path) if states_path.exists() else "",
@@ -1144,6 +1224,54 @@ def _quality_html(notes: list[dict]) -> str:
         return '<div class="note">暂无数据质量提示。</div>'
     rows = [{"级别": n.get("level", ""), "提示": n.get("message", "")} for n in notes]
     return _table_from_rows(rows)
+
+
+def _ensure_v2_reading_guide(readable: dict, stats_rows: list[dict]) -> dict:
+    readable = dict(readable or {})
+    existing = [str(x) for x in readable.get("signal_stats", []) if str(x).strip()]
+    guide = [
+        "阅读历史统计时，先看样本数 count，再看未来10根平均收益，最后看胜率；样本少于10次的信号只当线索，不当结论。",
+        _v2_signal_coverage_from_rows(stats_rows),
+    ]
+    if not any("覆盖情况" in item for item in existing):
+        readable["signal_stats"] = guide + existing
+    return readable
+
+
+def _v2_signal_coverage_from_rows(rows: list[dict]) -> str:
+    counts = {key: 0 for key in ["一买", "二买", "三买", "一卖", "二卖", "三卖"]}
+    for row in rows:
+        sig_type = str(row.get("signal_type", ""))
+        if sig_type not in counts:
+            continue
+        try:
+            counts[sig_type] += int(float(row.get("count") or 0))
+        except (TypeError, ValueError):
+            pass
+    buy = "，".join(f"{k} {counts[k]} 次" for k in ["一买", "二买", "三买"])
+    sell = "，".join(f"{k} {counts[k]} 次" for k in ["一卖", "二卖", "三卖"])
+    return f"信号覆盖情况：买点包括 {buy}；卖点包括 {sell}。如果一买没有出现在摘要前列，通常是样本少或收益排序不靠前，并不代表系统没有统计。"
+
+
+def _readable_html(readable: dict) -> str:
+    if not readable:
+        return '<div class="note">暂无白话解读。请查看原始报告文本。</div>'
+    sections = [
+        ("一句话", [readable.get("one_liner", "")]),
+        ("结构", readable.get("structure", [])),
+        ("最近信号", readable.get("recent_signals", [])),
+        ("历史统计", readable.get("signal_stats", [])),
+        ("风险", readable.get("risk", [])),
+        ("下一步", readable.get("next_steps", [])),
+    ]
+    chunks = []
+    for title, items in sections:
+        clean = [str(x) for x in items if str(x).strip()]
+        if not clean:
+            continue
+        body = "".join(f"<li>{_escape(item)}</li>" for item in clean)
+        chunks.append(f'<div class="group"><h4>{_escape(title)}</h4><ul class="brief-list">{body}</ul></div>')
+    return f'<div class="groups">{"".join(chunks)}</div>' if chunks else '<div class="note">暂无白话解读。</div>'
 
 
 def _build_metric_groups(stats: dict, per_symbol: list[dict]) -> dict[str, dict]:

@@ -10,6 +10,7 @@ import pytest
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "chan_strategy_system" / "backtest.py"
 UI_PATH = Path(__file__).resolve().parents[1] / "scripts" / "chan_strategy_system" / "ui.py"
 CORE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "chan_strategy_system" / "chan_core.py"
+BATCH_PATH = Path(__file__).resolve().parents[1] / "scripts" / "chan_strategy_system" / "batch_v2.py"
 
 
 def _load_module():
@@ -61,6 +62,19 @@ def test_ui_symbol_validation():
         module._validate_symbol("金风科技")
 
 
+def test_ui_v2_defaults_to_quick_mode():
+    spec = importlib.util.spec_from_file_location("chan_strategy_ui_args", UI_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    args = module._build_backtest_args({"symbol": "002202.SZ", "analysis_version": "v2", "mode": "mock"})
+    assert "--speed-mode" in args
+    assert args[args.index("--speed-mode") + 1] == "quick"
+    assert args[args.index("--analysis-freqs") + 1] == "日线,60分钟,30分钟"
+
+
 def test_v2_signal_classification():
     spec = importlib.util.spec_from_file_location("chan_strategy_core", CORE_PATH)
     assert spec and spec.loader
@@ -72,3 +86,34 @@ def test_v2_signal_classification():
     assert module.classify_candidate("30分钟_D1W9T2_第二买卖点V240524", "二买_任意_任意_0") == "二买"
     assert module.classify_candidate("30分钟_D1_三买辅助V230228", "三买_6笔_任意_0") == "三买"
     assert module.classify_candidate("30分钟_D1_三买辅助V230228", "其他_任意_任意_0") is None
+
+
+def test_batch_v2_custom_symbols_and_index_defaults():
+    spec = importlib.util.spec_from_file_location("chan_strategy_batch_v2", BATCH_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    assert module.POOL_INDEX_CODES["hs300"] == "000300.SH"
+    symbols = module._parse_custom_symbols("002202.sz, 002202.SZ,600036.sh")
+    assert symbols == ["002202.SZ", "600036.SH"]
+
+
+def test_batch_v2_resume_dir_reuses_existing_directory(tmp_path):
+    spec = importlib.util.spec_from_file_location("chan_strategy_batch_v2_resume", BATCH_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    batch_dir = tmp_path / "v2_batch_20260614_120245"
+    batch_dir.mkdir()
+    cfg = module.BatchConfig(output_dir=str(tmp_path), resume_dir=str(batch_dir))
+    assert module._new_batch_dir(cfg) == batch_dir
+    assert (batch_dir / "batch_config.json").exists()
+
+    marker_path = module._progress_path(batch_dir, "000001.SZ")
+    module._write_marker(marker_path, {"symbol": "000001.SZ", "status": "done", "run_dir": str(batch_dir)})
+    markers = module.load_progress_markers(batch_dir)
+    assert markers["000001.SZ"]["status"] == "done"
